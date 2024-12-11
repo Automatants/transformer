@@ -33,19 +33,26 @@ class GPT2(nn.Module):
         config = GPT2Config()
         model = GPT2(config)
         state_dict = model.state_dict()
-        keys = [key for key in state_dict.keys() if not key.endswith("attn.bias")]
+        keys = state_dict.keys()
+        keys = [key for key in keys if not key.endswith(".attn.bias")]
 
 
         model_hf = GPT2LMHeadModel.from_pretrained("gpt2")
         state_dict_hf = model_hf.state_dict()
-        keys_hf = [key for key in state_dict_hf.keys() if not key.endswith("attn.bias") and not key.endswith("attn.masked_bias")]
+        keys_hf = state_dict_hf.keys()
+        keys_hf = [key for key in keys_hf if not key.endswith(".attn.bias")]
+        keys_hf = [key for key in keys_hf if not key.endswith(".attn.masked_bias")]
         transposed_keys_hf = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        assert len(keys) == len(keys_hf), f"mismatched keys: {len(keys)} != {len(keys_hf)}"
 
         for key in keys_hf:
             if any(key.endswith(transposed_key) for transposed_key in transposed_keys_hf):
+                assert state_dict_hf[key].shape[::-1] == state_dict[key].shape
                 with torch.no_grad():
                     state_dict[key].copy_(state_dict_hf[key].T)
             else:
+                assert state_dict_hf[key].shape == state_dict[key].shape
                 with torch.no_grad():
                     state_dict[key].copy_(state_dict_hf[key])
         return model
