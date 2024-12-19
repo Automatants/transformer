@@ -56,3 +56,100 @@ class GPT2(nn.Module):
                 with torch.no_grad():
                     state_dict[key].copy_(state_dict_hf[key])
         return model
+    
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits # (B, T, vocab_size)
+        
+class Block(nn.Module):
+    """
+    Transformer Block
+    """
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
+
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+    
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x)) # residual connection
+        x = x + self.mlp(self.ln_2(x)) # residual connection
+        return x
+
+class MLP(nn.Module):
+    """
+    Multi-Layer Perceptron
+    """
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
+
+        self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x) # gelu used to curb vanishing gradients from relu
+        x = self.c_proj(x)
+        return x
+
+
+class CausalSelfAttention(nn.Module):
+    """
+    Causal Self-Attention
+    """
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.config = config
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+        # * 3 for k, v, q
+        self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3)
+
+        # projection output
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+
+        # causal mask to ensure that attention is only applied to the past tokens
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, 
+            config.block_size)).view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # calculate query, key, value
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+
+        # reshape q, k, v for multi-head attention
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        masked_attn_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        masked_attn_scores = masked_attn_scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        attn = F.softmax(masked_attn_scores, dim=-1)
+        y = attn @ v
+        #y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.c_proj(y)
+        return y
+
+
